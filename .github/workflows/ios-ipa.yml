@@ -1,0 +1,88 @@
+name: iOS unsigned IPA
+
+# Builds an unsigned Mural.ipa for personal sideloading with AltStore/SideStore.
+# The artifact is NOT code signed: AltServer re-signs it with your own Apple ID
+# on your own machine, so this workflow needs no Apple certificates or secrets.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          best=$(for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+              "$app/Contents/Info.plist" 2>/dev/null) || continue
+            printf '%s %s\n' "$v" "$app"
+          done | sort -V | tail -1)
+          [ -n "$best" ] || { echo "::error::No Xcode found on the runner."; exit 1; }
+          version=${best%% *}
+          path=${best#* }
+          if [ "${version%%.*}" -lt 26 ]; then
+            echo "::error::Mural targets iOS 26.1 and needs Xcode 26 or later. Newest available: $version at $path"
+            exit 1
+          fi
+          sudo xcode-select -s "$path/Contents/Developer"
+          xcodebuild -version
+
+      - name: Resolve pinned dependencies
+        run: |
+          xcodebuild -project apps/ios/Mural.xcodeproj \
+            -scheme Mural \
+            -resolvePackageDependencies
+
+      - name: Archive without code signing
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project apps/ios/Mural.xcodeproj \
+            -scheme Mural \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Mural.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package Payload into an IPA
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Mural.xcarchive/Products/Applications/Mural.app"
+          [ -d "$app" ] || { echo "::error::Archive produced no Mural.app"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$app" "$RUNNER_TEMP/out/Payload/"
+          ( cd "$RUNNER_TEMP/out" && zip -qry Mural-unsigned.ipa Payload )
+          cd "$RUNNER_TEMP/out"
+          shasum -a 256 Mural-unsigned.ipa | tee SHA256SUMS.txt
+          ls -lh Mural-unsigned.ipa
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Mural-unsigned-ipa
+          path: |
+            ${{ runner.temp }}/out/Mural-unsigned.ipa
+            ${{ runner.temp }}/out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
